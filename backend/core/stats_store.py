@@ -19,6 +19,17 @@ from .db import get_main_db
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "inksight.db")
 
 
+def _usage_source_to_api_kind(usage_source: str) -> str:
+    normalized = (usage_source or "").strip().lower()
+    if not normalized:
+        return "-"
+    if normalized in {"current_user_api_key", "owner_api_key"}:
+        return "api url"
+    if normalized in {"current_user_free_quota", "owner_free_quota", "server_api_key"}:
+        return "invite code"
+    return normalized.replace("_", " ")
+
+
 async def init_stats_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
@@ -66,18 +77,199 @@ async def init_stats_db():
                 UNIQUE(mac, habit_name, date)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS app_event_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                level TEXT NOT NULL DEFAULT 'info',
+                category TEXT NOT NULL DEFAULT 'system',
+                event_type TEXT NOT NULL DEFAULT 'event',
+                actor_type TEXT NOT NULL DEFAULT '',
+                actor_id TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                mac TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            )
+        """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_render_logs_mac ON render_logs(mac)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_render_logs_created ON render_logs(created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_heartbeats_mac ON device_heartbeats(mac)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_content_history_mac ON content_history(mac)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_content_history_hash ON content_history(mac, mode_id, content_hash)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_habit_mac ON habit_records(mac)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_app_event_logs_created ON app_event_logs(created_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_app_event_logs_category ON app_event_logs(category)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_app_event_logs_level ON app_event_logs(level)")
         # Migration: add is_fallback column if missing (for existing databases)
         try:
             await db.execute("ALTER TABLE render_logs ADD COLUMN is_fallback INTEGER DEFAULT 0")
         except aiosqlite.OperationalError:
             pass  # column already exists
         await db.commit()
+
+
+async def log_app_event(
+    *,
+    level: str = "info",
+    category: str = "system",
+    event_type: str = "event",
+    actor_type: str = "",
+    actor_id: str | int = "",
+    username: str = "",
+    mac: str = "",
+    message: str = "",
+    details: dict | None = None,
+):
+    now = datetime.now().isoformat()
+    safe_details = details or {}
+    db = await get_main_db()
+    await db.execute(
+        """
+        INSERT INTO app_event_logs
+            (level, category, event_type, actor_type, actor_id, username, mac, message, details_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (level or "info").strip().lower(),
+            (category or "system").strip().lower(),
+            (event_type or "event").strip().lower(),
+            (actor_type or "").strip().lower(),
+            str(actor_id or ""),
+            username or "",
+            mac or "",
+            message or "",
+            json.dumps(safe_details, ensure_ascii=False),
+            now,
+        ),
+    )
+    await db.commit()
+
+
+async def query_app_events(
+    *,
+    level: str = "",
+    levels: list[str] | tuple[str, ...] | None = None,
+    category: str = "",
+    query: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    normalized_levels = [item.strip().lower() for item in (levels or []) if str(item).strip()]
+    if normalized_levels:
+        placeholders = ", ".join("?" for _ in normalized_levels)
+        clauses.append(f"level IN ({placeholders})")
+        params.extend(normalized_levels)
+    elif level.strip():
+        clauses.append("level = ?")
+        params.append(level.strip().lower())
+    if category.strip():
+        clauses.append("category = ?")
+        params.append(category.strip().lower())
+    if query.strip():
+        like = f"%{query.strip()}%"
+        clauses.append("(message LIKE ? OR event_type LIKE ? OR username LIKE ? OR mac LIKE ? OR details_json LIKE ?)")
+        params.extend([like, like, like, like, like])
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    db = await get_main_db()
+    cursor = await db.execute(
+        f"""
+        SELECT id, level, category, event_type, actor_type, actor_id, username, mac, message, details_json, created_at
+        FROM app_event_logs
+        {where}
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (*params, limit, offset),
+    )
+    rows = await cursor.fetchall()
+    user_ids_to_resolve: set[int] = set()
+    parsed_rows: list[tuple[Any, dict]] = []
+    for row in rows:
+        try:
+            details = json.loads(row[9]) if row[9] else {}
+        except (json.JSONDecodeError, TypeError):
+            details = {}
+        parsed_rows.append((row, details))
+        actor_type = str(row[4] or "").strip().lower()
+        actor_id = str(row[5] or "").strip()
+        username = str(row[6] or "").strip()
+        if not username and actor_type == "user" and actor_id.isdigit():
+            user_ids_to_resolve.add(int(actor_id))
+
+    usernames_by_id: dict[int, str] = {}
+    if user_ids_to_resolve:
+        placeholders = ", ".join("?" for _ in user_ids_to_resolve)
+        user_cursor = await db.execute(
+            f"SELECT id, username FROM users WHERE id IN ({placeholders})",
+            tuple(user_ids_to_resolve),
+        )
+        for user_row in await user_cursor.fetchall():
+            try:
+                usernames_by_id[int(user_row[0])] = str(user_row[1] or "").strip()
+            except (TypeError, ValueError):
+                continue
+
+    items: list[dict] = []
+    for row, details in parsed_rows:
+        actor_type = str(row[4] or "").strip().lower()
+        actor_id = str(row[5] or "").strip()
+        username = str(row[6] or "").strip()
+        if not username and actor_type == "user" and actor_id.isdigit():
+            username = usernames_by_id.get(int(actor_id), "")
+        if not username:
+            username = str(details.get("username") or "").strip()
+
+        mac = str(row[7] or "").strip() or str(details.get("mac") or "").strip()
+        request_surface = str(details.get("request_surface") or "").strip().lower()
+        category_name = str(row[2] or "").strip().lower()
+        is_no_device_preview = (not mac) and (
+            request_surface == "no_device_preview" or category_name in {"llm", "preview"}
+        )
+        display_mac = "no device preview" if is_no_device_preview else (mac or "-")
+        display_username = username or "anonymous"
+        usage_source = str(details.get("usage_source") or "").strip()
+        api_kind = _usage_source_to_api_kind(usage_source)
+        if api_kind == "-" and category_name in {"llm", "preview"}:
+            api_kind = "invite code"
+        model_name = (
+            str(details.get("model") or "").strip()
+            or str(details.get("llm_model") or "").strip()
+            or str(details.get("image_model") or "").strip()
+        )
+        raw_message = (
+            str(details.get("raw_message") or "").strip()
+            or str(details.get("error") or "").strip()
+            or str(details.get("raw_error") or "").strip()
+            or str(row[8] or "").strip()
+        )
+        items.append(
+            {
+                "id": row[0],
+                "level": row[1],
+                "category": row[2],
+                "event_type": row[3],
+                "actor_type": actor_type,
+                "actor_id": actor_id,
+                "username": username,
+                "mac": mac,
+                "display_username": display_username,
+                "display_mac": display_mac,
+                "usage_source": usage_source,
+                "api_kind": api_kind,
+                "model_name": model_name or "-",
+                "message": row[8],
+                "raw_message": raw_message,
+                "is_no_device_preview": is_no_device_preview,
+                "details": details,
+                "created_at": row[10],
+            }
+        )
+    return items
 
 
 async def log_render(

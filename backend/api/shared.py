@@ -333,6 +333,7 @@ async def build_image(
     preview_mode_override: Optional[dict] = None,
     preview_memo_text: Optional[str] = None,
     current_user_id: Optional[int] = None,
+    current_username: Optional[str] = None,
     user_api_key: Optional[str] = None,
     intent_only: bool = False,
 ):
@@ -475,6 +476,13 @@ async def build_image(
         usage_source = "current_user_free_quota"
     elif mac:
         usage_source = "owner_free_quota"
+
+    if current_user_id is not None or current_username or not mac:
+        config = dict(config or {})
+        config["_log_actor_id"] = str(current_user_id or "")
+        config["_log_username"] = (current_username or "").strip()
+        config["_request_surface"] = "device_preview" if mac else "no_device_preview"
+        config["_log_usage_source"] = usage_source
 
     # 是否为需要 LLM 的 JSON 模式（需要额度管控的类型）
     # 需要检查顶层 content 类型，以及 composite 模式中的 steps

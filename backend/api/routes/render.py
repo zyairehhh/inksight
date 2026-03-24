@@ -292,12 +292,14 @@ async def preview(
     # - 用于 Web 预览时关联 user_llm_config（个人信息里的 API Key）
     # - 计费归属仍按 BILLING.md：设备端按 owner 计费，Web 端按登录用户计费
     current_user_id = None
+    current_username = ""
     try:
         from core.auth import get_current_user_optional
 
         current_user = await get_current_user_optional(request, ink_session)
         if current_user:
             current_user_id = current_user.get("user_id")
+            current_username = str(current_user.get("username") or "")
             logger.debug("[PREVIEW] Current user_id=%s for preview (mac=%s)", current_user_id, mac)
     except Exception:
         logger.warning("[PREVIEW] Failed to resolve current user for preview", exc_info=True)
@@ -323,6 +325,7 @@ async def preview(
             preview_mode_override=parsed_mode_override,
             preview_memo_text=(memo_text if isinstance(memo_text, str) else None),
             current_user_id=current_user_id,
+            current_username=current_username,
             user_api_key=x_inksight_llm_api_key,
             intent_only=(intent == 1),
         )
@@ -417,12 +420,14 @@ async def preview_stream(
     
     # 获取当前登录用户 ID：同上，用于合入 user_llm_config，而计费仍按 owner / 登录用户归属
     current_user_id = None
+    current_username = ""
     try:
         from core.auth import get_current_user_optional
 
         current_user = await get_current_user_optional(request, ink_session)
         if current_user:
             current_user_id = current_user.get("user_id")
+            current_username = str(current_user.get("username") or "")
             logger.debug("[PREVIEW_STREAM] Current user_id=%s for preview (mac=%s)", current_user_id, mac)
     except Exception:
         logger.warning("[PREVIEW_STREAM] Failed to resolve current user for preview", exc_info=True)
@@ -451,6 +456,7 @@ async def preview_stream(
                 preview_mode_override=parsed_mode_override,
                 preview_memo_text=(memo_text if isinstance(memo_text, str) else None),
                 current_user_id=current_user_id,
+                current_username=current_username,
                 user_api_key=x_inksight_llm_api_key,
             )
             # 如果 API key 无效，返回错误事件

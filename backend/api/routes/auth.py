@@ -7,6 +7,7 @@ import aiosqlite
 from fastapi import APIRouter, Depends, Response
 from fastapi.responses import JSONResponse
 
+from core.admin_store import redeem_invitation_code
 from core.auth import clear_session_cookie, create_session_token, require_user, set_session_cookie
 from core.config_store import authenticate_user, _hash_password, get_user_api_quota
 from core.db import get_main_db
@@ -126,73 +127,11 @@ async def auth_logout(response: Response):
 @router.post("/auth/redeem-invite-code")
 async def auth_redeem_invite_code(body: dict, user_id: int = Depends(require_user)):
     """兑换邀请码，为当前用户增加 50 次免费 LLM 调用额度"""
-    invite_code = (body.get("invite_code") or "").strip()
-    
-    if not invite_code:
-        return JSONResponse({"error": "邀请码不能为空"}, status_code=400)
-    
-    db = await get_main_db()
-    
-    try:
-        # 显式开启事务，确保「校验邀请码 -> 标记邀请码 -> 增加额度」原子完成
-        await db.execute("BEGIN")
-        
-        # 1) 校验邀请码是否存在且未使用
-        cursor = await db.execute(
-            "SELECT id, code, is_used FROM invitation_codes WHERE code = ? LIMIT 1",
-            (invite_code,),
-        )
-        row = await cursor.fetchone()
-        if not row:
-            await db.rollback()
-            return JSONResponse({"error": "邀请码无效"}, status_code=400)
-        if row[2]:  # is_used
-            await db.rollback()
-            return JSONResponse({"error": "邀请码已被使用"}, status_code=409)
-        
-        # 2) 标记邀请码已被当前用户使用
-        await db.execute(
-            """
-            UPDATE invitation_codes
-            SET is_used = 1, used_by_user_id = ?
-            WHERE code = ?
-            """,
-            (user_id, invite_code),
-        )
-        
-        # 3) 增加用户的免费额度（+50 次）
-        # 先确保 api_quotas 记录存在
-        await db.execute(
-            """
-            INSERT OR IGNORE INTO api_quotas (user_id, total_calls_made, free_quota_remaining)
-            VALUES (?, 0, 0)
-            """,
-            (user_id,),
-        )
-        # 增加额度（使用原子更新，避免并发问题）
-        await db.execute(
-            """
-            UPDATE api_quotas
-            SET free_quota_remaining = free_quota_remaining + 50
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        )
-        
-        await db.commit()
-        
-        # 获取更新后的额度信息
-        quota = await get_user_api_quota(user_id)
-        return {
-            "ok": True,
-            "message": "邀请码兑换成功，已获得 50 次免费 LLM 调用额度",
-            "free_quota_remaining": quota.get("free_quota_remaining", 0) if quota else 0,
-        }
-    except aiosqlite.IntegrityError:
-        await db.rollback()
-        return JSONResponse({"error": "邀请码已被使用"}, status_code=409)
-    except Exception as e:
-        await db.rollback()
-        logger = __import__("logging").getLogger(__name__)
-        logger.error(f"[REDEEM_INVITE] Failed to redeem invite code: {e}", exc_info=True)
-        return JSONResponse({"error": "兑换失败，请稍后重试"}, status_code=500)
+    result = await redeem_invitation_code(user_id=user_id, invite_code=(body.get("invite_code") or "").strip())
+    if not result.get("ok"):
+        return JSONResponse({"error": result["error"]}, status_code=int(result.get("status_code") or 400))
+    return {
+        "ok": True,
+        "message": f"邀请码兑换成功，已获得 {int(result['grant_amount'])} 次免费 LLM 调用额度",
+        "free_quota_remaining": int(result["free_quota_remaining"]),
+    }

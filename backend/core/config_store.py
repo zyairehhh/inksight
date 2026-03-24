@@ -229,6 +229,11 @@ async def init_db():
                 is_used INTEGER DEFAULT 0,
                 generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 used_by_user_id INTEGER,
+                grant_amount INTEGER DEFAULT 50,
+                remark TEXT DEFAULT '',
+                batch_id TEXT DEFAULT '',
+                generated_by TEXT DEFAULT '',
+                used_at TEXT DEFAULT '',
                 FOREIGN KEY (used_by_user_id) REFERENCES users(id)
             )
         """)
@@ -256,13 +261,18 @@ async def init_db():
                         is_used INTEGER DEFAULT 0,
                         generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         used_by_user_id INTEGER,
+                        grant_amount INTEGER DEFAULT 50,
+                        remark TEXT DEFAULT '',
+                        batch_id TEXT DEFAULT '',
+                        generated_by TEXT DEFAULT '',
+                        used_at TEXT DEFAULT '',
                         FOREIGN KEY (used_by_user_id) REFERENCES users(id)
                     )
                 """)
                 # 迁移数据
                 await db.execute("""
-                    INSERT INTO invitation_codes_new (code, is_used, generated_at, used_by_user_id)
-                    SELECT code, is_used, generated_at, used_by_user_id FROM invitation_codes
+                    INSERT INTO invitation_codes_new (code, is_used, generated_at, used_by_user_id, grant_amount, remark, batch_id, generated_by, used_at)
+                    SELECT code, is_used, generated_at, used_by_user_id, 50, '', '', '', '' FROM invitation_codes
                 """)
                 # 删除旧表
                 await db.execute("DROP TABLE invitation_codes")
@@ -279,6 +289,25 @@ async def init_db():
                 logger.info("[MIGRATION] invitation_codes table migration completed")
         except Exception as e:
             logger.warning(f"[MIGRATION] Failed to migrate invitation_codes table: {e}", exc_info=True)
+
+        # Migration: add invitation metadata columns if missing
+        try:
+            cursor = await db.execute("PRAGMA table_info(invitation_codes)")
+            columns = await cursor.fetchall()
+            names = [c[1] for c in columns]
+            if "grant_amount" not in names:
+                await db.execute("ALTER TABLE invitation_codes ADD COLUMN grant_amount INTEGER DEFAULT 50")
+            if "remark" not in names:
+                await db.execute("ALTER TABLE invitation_codes ADD COLUMN remark TEXT DEFAULT ''")
+            if "batch_id" not in names:
+                await db.execute("ALTER TABLE invitation_codes ADD COLUMN batch_id TEXT DEFAULT ''")
+            if "generated_by" not in names:
+                await db.execute("ALTER TABLE invitation_codes ADD COLUMN generated_by TEXT DEFAULT ''")
+            if "used_at" not in names:
+                await db.execute("ALTER TABLE invitation_codes ADD COLUMN used_at TEXT DEFAULT ''")
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"[MIGRATION] Failed to add invitation metadata columns: {e}", exc_info=True)
 
         # API quotas table API额度表
         await db.execute("""

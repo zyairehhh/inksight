@@ -95,6 +95,7 @@
 如果你是开发者、想在本地部署一套服务，或者不仅仅满足我们提供的官网服务，准备二次开发、联调 API 和前后端流程，请从这里进入：
 
 - 中文部署文档：[`docs/deploy.md`](docs/deploy.md)
+- 管理员控制台：[`docs/admin-console.md`](docs/admin-console.md)
 - English deployment guide: [`docs/en/deploy.md`](docs/en/deploy.md)
 - 架构设计：[`docs/architecture.md`](docs/architecture.md)
 - API：[`docs/api.md`](docs/api.md)

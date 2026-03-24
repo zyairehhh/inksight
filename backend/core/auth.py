@@ -18,7 +18,7 @@ from typing import Optional
 import jwt
 from fastapi import Cookie, Header, HTTPException, Request, Response
 
-from .config_store import validate_device_token, get_device_state
+from .config_store import _verify_password, validate_device_token, get_device_state
 from .i18n import detect_lang_from_request, msg, normalize_lang
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,8 @@ _JWT_SECRET = _load_jwt_secret()
 _JWT_ALGORITHM = "HS256"
 _JWT_EXPIRE_DAYS = 30
 _COOKIE_NAME = "ink_session"
+_ADMIN_COOKIE_NAME = "ink_admin_session"
+_ADMIN_SESSION_SCOPE = "admin_console"
 
 _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
@@ -104,6 +106,41 @@ def create_session_token(user_id: int, username: str) -> str:
     return jwt.encode(payload, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
 
 
+def _get_admin_session_secret() -> str:
+    return (os.environ.get("ADMIN_CONSOLE_SESSION_SECRET") or "").strip() or _JWT_SECRET
+
+
+def get_admin_console_username() -> str:
+    return (os.environ.get("ADMIN_CONSOLE_USERNAME") or "").strip()
+
+
+def get_admin_console_password_hash() -> str:
+    return (os.environ.get("ADMIN_CONSOLE_PASSWORD_HASH") or "").strip()
+
+
+def is_admin_console_configured() -> bool:
+    return bool(get_admin_console_username() and get_admin_console_password_hash())
+
+
+def verify_admin_console_credentials(username: str, password: str) -> bool:
+    expected_username = get_admin_console_username()
+    expected_hash = get_admin_console_password_hash()
+    if not expected_username or not expected_hash:
+        return False
+    if not hmac.compare_digest((username or "").strip(), expected_username):
+        return False
+    return _verify_password(password or "", expected_hash)
+
+
+def create_admin_session_token(username: str) -> str:
+    payload = {
+        "scope": _ADMIN_SESSION_SCOPE,
+        "username": username,
+        "exp": datetime.now(timezone.utc) + timedelta(days=_JWT_EXPIRE_DAYS),
+    }
+    return jwt.encode(payload, _get_admin_session_secret(), algorithm=_JWT_ALGORITHM)
+
+
 def decode_session_token(token: str) -> dict | None:
     """Decode JWT session token.
     
@@ -126,6 +163,14 @@ def decode_session_token(token: str) -> dict | None:
         return None
 
 
+def decode_admin_session_token(token: str) -> dict | None:
+    try:
+        return jwt.decode(token, _get_admin_session_secret(), algorithms=[_JWT_ALGORITHM])
+    except jwt.PyJWTError as e:
+        logger.warning(f"[AUTH] decode_admin_session_token: {type(e).__name__}: {e}")
+        return None
+
+
 def set_session_cookie(response: Response, token: str):
     response.set_cookie(
         key=_COOKIE_NAME,
@@ -139,6 +184,22 @@ def set_session_cookie(response: Response, token: str):
 
 def clear_session_cookie(response: Response):
     response.delete_cookie(key=_COOKIE_NAME, path="/")
+
+
+def set_admin_session_cookie(response: Response, token: str):
+    response.set_cookie(
+        key=_ADMIN_COOKIE_NAME,
+        value=token,
+        max_age=_JWT_EXPIRE_DAYS * 86400,
+        httponly=True,
+        samesite="lax",
+        secure=(os.environ.get("ADMIN_CONSOLE_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes")),
+        path="/",
+    )
+
+
+def clear_admin_session_cookie(response: Response):
+    response.delete_cookie(key=_ADMIN_COOKIE_NAME, path="/")
 
 
 def _extract_user(
@@ -222,20 +283,47 @@ async def get_current_user_optional(
     # 查询数据库获取 role
     try:
         db = await get_main_db()
-        cursor = await db.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+        cursor = await db.execute("SELECT username, role FROM users WHERE id = ?", (user_id,))
         row = await cursor.fetchone()
         
         if not row:
             logger.warning(f"[AUTH] get_current_user_optional: User {user_id} not found in database")
             return None
         
-        user_role = row[0] or "user"  # 默认 role 为 'user'
+        username = row[0] or str(payload.get("username") or "")
+        user_role = row[1] or "user"  # 默认 role 为 'user'
         logger.info(f"[AUTH] get_current_user_optional: User {user_id} has role={user_role}")
-        return {"user_id": user_id, "role": user_role}
+        return {"user_id": user_id, "role": user_role, "username": username}
     except Exception as e:
         # 数据库查询失败时返回 None，不抛异常
         logger.warning(f"[AUTH] Failed to query user role for user_id={user_id}: {e}")
         return None
+
+
+async def require_admin_console_user(
+    request: Request,
+    ink_admin_session: Optional[str] = Cookie(default=None, alias=_ADMIN_COOKIE_NAME),
+    authorization: Optional[str] = Header(default=None),
+) -> str:
+    from .i18n import detect_lang_from_request, msg
+
+    if os.environ.get("ADMIN_TOKEN") and authorization and is_admin_authorized(authorization):
+        return get_admin_console_username() or "admin-token"
+
+    if not is_admin_console_configured():
+        raise HTTPException(status_code=503, detail="Admin console is not configured")
+
+    if not ink_admin_session:
+        raise HTTPException(status_code=401, detail=msg("auth.login_required", detect_lang_from_request(request)))
+
+    payload = decode_admin_session_token(ink_admin_session)
+    if not payload or payload.get("scope") != _ADMIN_SESSION_SCOPE:
+        raise HTTPException(status_code=401, detail=msg("auth.login_required", detect_lang_from_request(request)))
+
+    username = str(payload.get("username") or "").strip()
+    if not username or not hmac.compare_digest(username, get_admin_console_username()):
+        raise HTTPException(status_code=401, detail=msg("auth.login_required", detect_lang_from_request(request)))
+    return username
 
 
 async def get_current_root_user(

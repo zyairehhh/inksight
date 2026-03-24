@@ -1,3 +1,4 @@
+from .admin import router as admin_router
 from .auth import router as auth_router
 from .config import router as config_router
 from .device import router as device_router
@@ -17,6 +18,7 @@ api_routers = [
     device_router,
     modes_router,
     auth_router,
+    admin_router,
     user_router,
     mobile_router,
     stats_router,

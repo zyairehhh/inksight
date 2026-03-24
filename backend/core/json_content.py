@@ -295,6 +295,35 @@ async def generate_json_mode_content(
             # 这里捕获所有 LLM 调用异常（包括 OpenAI/DeepSeek 的 BadRequestError 等），
             # 避免将 4xx/5xx 直接抛到上层导致 500，而是统一回退到 fallback 内容。
             logger.error(f"[JSONContent] LLM call failed for {mode_id}: {e}")
+            try:
+                from .stats_store import log_app_event
+                log_cfg = config or {}
+                log_username = str(log_cfg.get("_log_username") or "").strip()
+                log_actor_id = str(log_cfg.get("_log_actor_id") or "").strip()
+                request_surface = str(log_cfg.get("_request_surface") or ("device_preview" if mac else "no_device_preview"))
+                usage_source = str(log_cfg.get("_log_usage_source") or "").strip()
+
+                await log_app_event(
+                    level="error",
+                    category="llm",
+                    event_type="json_mode_llm_failed",
+                    actor_type="user" if (log_actor_id or log_username) else "system",
+                    actor_id=log_actor_id,
+                    username=log_username,
+                    mac=mac,
+                    message=f"LLM call failed for {mode_id}",
+                    details={
+                        "mode_id": mode_id,
+                        "provider": provider,
+                        "model": model,
+                        "usage_source": usage_source,
+                        "error": str(e),
+                        "raw_message": str(e),
+                        "request_surface": request_surface,
+                    },
+                )
+            except Exception:
+                logger.warning("[JSONContent] Failed to persist app event log", exc_info=True)
             if DISABLE_FALLBACK:
                 result = {"text": f"[LLM_ERROR] {e}", "_is_fallback": True, "_llm_used": True, "_llm_ok": False}
                 return _apply_post_process(result, content_cfg)
